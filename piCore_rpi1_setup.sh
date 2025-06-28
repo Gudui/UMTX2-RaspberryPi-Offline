@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # --- Config --- #
-ALPINE_VERSION="3.21.0"
+ALPINE_VERSION="3.22.0"
 ARCH="armhf"
 DEVICE="/dev/mmcblk0"   # ← verify this
 BOOT_P="${DEVICE}p1"
@@ -19,6 +19,9 @@ UMTX2_REPO="https://github.com/idlesauce/umtx2"
 STATIC_IP="192.168.2.5/24"
 GATEWAY="192.168.2.1"
 HOSTNAME="alpinepi"
+SPOOF_IP="${STATIC_IP%/*}"
+IP4=${STATIC_IP%%/*}               # → 192.168.2.5 (used later for FakeDNS patch)
+
 
 # --- Check prerequisites --- #
 for cmd in parted mkfs.vfat mkfs.ext4 wget git tar chroot; do
@@ -96,7 +99,10 @@ sudo cp /etc/resolv.conf "$MNT_ROOT/etc/"
 
 # --- Enable essential services --- #
 echo "[6] Installing and configuring in chroot…"
-sudo chroot "$MNT_ROOT" /bin/sh <<'EOF'
+
+# --- Enable essential services --- #
+echo "[6] Installing and configuring in chroot…"
+sudo chroot "$MNT_ROOT" /bin/sh <<EOF
 mount -t proc none /proc
 mount -t sysfs none /sys
 mount -t devtmpfs none /dev
@@ -104,8 +110,16 @@ mount -t devtmpfs none /dev
 apk update
 apk add openrc e2fsprogs util-linux linux-firmware-brcm \
         raspberrypi-bootloader linux-rpi python3 py3-pip git openssl
+apk add --no-cache ifupdown-ng ifupdown-ng-openrc   # provides /etc/init.d/ifupdown-ng
+apk add chrony
+apk add curl
+apk add nano
+apk add iproute2
+apk add lsof
+apk add py3-flask
+#mkinitfs -c /etc/mkinitfs/mkinitfs.conf -b / -F -o /boot/initramfs-rpi
+mkinitfs -b / -k rpi -o /boot/initramfs-rpi
 
-mkinitfs -c /etc/mkinitfs/mkinitfs.conf -b / -F -o /boot/initramfs-rpi
 
 rc-update add devfs sysinit
 rc-update add dmesg sysinit
@@ -119,32 +133,115 @@ rc-update add networking boot
 rc-update add killprocs shutdown
 rc-update add mount-ro shutdown
 rc-update add savecache shutdown
+ rc-update add chronyd default
+ rc-update add networking boot
+ 
 
-# Clone & patch uMTX2
-rm -rf /opt/umtx2
-git clone https://github.com/idlesauce/umtx2 /opt/umtx2
-sed -i 's/443/80/' /opt/umtx2/host.py
-sed -i '/if self.headers.get/,/else:/c\
-        if self.path.startswith("/document/en/ps5"):\
-            return self.serve_userguide()\
-        return super().do_GET()' /opt/umtx2/host.py
+passwd -d root
 
-# Create init.d directory if missing
-mkdir -p /etc/init.d
+mkdir -p /etc/init.d /var/log/umtx2 /run
 
-# Create OpenRC service
-cat >/etc/init.d/umtx2 <<EOL
+
+# — net‑provide: export virtual facility “net”
+
+
+cat >/etc/init.d/net-provide <<'NET'
 #!/sbin/openrc-run
-command="/usr/bin/python3"
-command_args="/opt/umtx2/host.py --port 80"
-pidfile="/run/umtx2.pid"
-depend() {
-  need network
-}
-EOL
-chmod +x /etc/init.d/umtx2
-rc-update add umtx2 default
+description="Marks the network stack as ready (provides virtual facility net)"
 
+depend() {
+    need networking        # wait until /etc/init.d/networking is running
+    provide net            # then satisfy every ‘need net’
+}
+
+start() {                  # one-shot, stays ‘started’ as soon as it returns 0
+    ebegin "Providing virtual facility net"
+    eend 0
+}
+NET
+chmod +x /etc/init.d/net-provide
+rc-update add net-provide boot
+
+
+# — uMTX2 clone —
+rm -rf /opt/umtx2
+git clone "$UMTX2_REPO" /opt/umtx2
+
+# switch HTTPS → HTTP port
+sed -i 's/:443/:80/g' /opt/umtx2/host.py
+sed -i 's/ssl_context=.*/# ssl disabled by build script/' /opt/umtx2/host.py
+# ── insert 302 redirect for “/” → /document/en/ps5/index.html ───────────────
+# overwrite do_GET so root URL issues HTTP-302
+apply_redirect() {
+  python - "$@" <<'PY'
+import pathlib, textwrap, re, sys
+p = pathlib.Path('/opt/umtx2/host.py')
+src = p.read_text().splitlines()
+out = []
+skip = False
+for line in src:
+    if line.startswith('    def do_GET('):
+        skip = True          # drop the old version
+        # new implementation
+        out.append('    def do_GET(self):')
+        out.append('        self.replace_locale()')
+        out.append("        if self.path in (\"/\", \"\"):")
+        out.append('            self.send_response(302)')
+        out.append('            self.send_header("Location", "/document/en/ps5/index.html")')
+        out.append('            self.end_headers()')
+        out.append('            return')
+        out.append('        return super().do_GET()')
+        continue
+    if skip and re.match(r'^\s*def ', line):
+        skip = False         # reached next method
+    if not skip:
+        out.append(line)
+p.write_text('\n'.join(out) + '\n')
+PY
+}
+apply_redirect
+# patch FakeDNS: replace gethostbyname().local with static IP
+sed -i "s/socket.gethostbyname(socket.gethostname()+\".local\")/'$IP4'/g" \
+       /opt/umtx2/fakedns.py
+# Variant with single quotes
+sed -i "s/socket.gethostbyname(socket.gethostname()+'.local')/'$IP4'/g" \
+       /opt/umtx2/fakedns.py
+
+# ----------------  umtx2-http -----------------
+cat > /etc/init.d/umtx2-http <<'HTTP'
+#!/sbin/openrc-run
+description="uMTX2 HTTP server"
+command="/usr/bin/python3"
+command_args="/opt/umtx2/host.py"
+directory="/opt/umtx2"
+supervisor="supervise-daemon"
+pidfile="/run/umtx2-http.pid"
+output_log="/var/log/umtx2/http.log"
+error_log="/var/log/umtx2/http.err"
+depend() { need net; }
+start_pre() { checkpath --directory --mode 0755 /var/log/umtx2; }
+HTTP
+chmod +x /etc/init.d/umtx2-http
+rc-update add umtx2-http default
+
+
+# ----------------  umtx2-dns ------------------
+cat > /etc/init.d/umtx2-dns <<'DNS'
+#!/sbin/openrc-run
+description="uMTX2 FakeDNS"
+command="/usr/bin/python3"
+command_args="/opt/umtx2/fakedns.py -i 0.0.0.0 -p 53"
+directory="/opt/umtx2"
+supervisor="supervise-daemon"
+pidfile="/run/umtx2-dns.pid"
+output_log="/var/log/umtx2/dns.log"
+error_log="/var/log/umtx2/dns.err"
+depend() { need net; }
+start_pre() { checkpath --directory --mode 0755 /var/log/umtx2; }
+DNS
+chmod +x /etc/init.d/umtx2-dns
+rc-update add umtx2-dns default
+# ------------------------------------------------------------------
 umount /proc /sys /dev
 EOF
 
