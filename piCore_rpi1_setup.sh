@@ -246,10 +246,21 @@ umount /proc /sys /dev
 EOF
 
 # --- Install bootloader files --- #
-echo "[7] Installing Raspberry Pi boot files…"
+echo "[7] Installing Raspberry Pi firmware & DTBs…"
 TMP_BOOT=$(mktemp -d)
 git clone --depth 1 --branch stable "$BOOTFILES_REPO" "$TMP_BOOT"
-sudo cp "$TMP_BOOT"/boot/{bootcode.bin,start.elf,fixup.dat} "$MNT_ROOT/boot/"
+
+# ── Mandatory blobs ───────────────────────────────────────────────────
+sudo cp "$TMP_BOOT"/boot/bootcode.bin              "$MNT_ROOT/boot/"
+sudo cp "$TMP_BOOT"/boot/start*.elf                "$MNT_ROOT/boot/"
+sudo cp "$TMP_BOOT"/boot/fixup*.dat                "$MNT_ROOT/boot/"
+
+# ── Board-specific device-trees  (Pi 2/3/4/Zero 2, CM, etc.) ──────────
+sudo cp "$TMP_BOOT"/boot/bcm*.dtb                  "$MNT_ROOT/boot/"
+
+# ── All overlay blobs - required if config.txt references any of them ─
+sudo cp -r "$TMP_BOOT"/boot/overlays               "$MNT_ROOT/boot/"
+
 sudo tee "$MNT_ROOT/boot/config.txt" >/dev/null <<EOF
 disable_overscan=1
 enable_uart=1
